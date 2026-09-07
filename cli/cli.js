@@ -80,6 +80,17 @@ if (args[0] === "xai" && args[1] === "video") {
   return;
 }
 
+if (args[0] === "mitm") {
+  const { run } = require("./src/cli/commands/mitm");
+  run(args.slice(1))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(`❌ ${err?.message || err}`);
+      process.exit(1);
+    });
+  return;
+}
+
 // Self-heal SQLite runtime deps (sql.js + better-sqlite3) into ~/.9router/runtime
 // so the server can resolve them via NODE_PATH. Best-effort — sql.js is required,
 // better-sqlite3 is optional. Logs to stderr only on failure.
@@ -157,6 +168,10 @@ Commands:
   xai video --prompt "..." --output video.mp4
                       Generate a Grok Imagine video via the running gateway
                       (see: ${APP_NAME} xai video --help)
+
+  mitm start|stop|status
+                      Control the MITM proxy for closed IDEs (Antigravity)
+                      (see: ${APP_NAME} mitm --help)
 `);
     process.exit(0);
   } else if (args[i] === "--version" || args[i] === "-v") {

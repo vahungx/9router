@@ -83,6 +83,9 @@ function configure(options = {}) {
  * @param {Object} body - Request body (optional)
  * @returns {Promise<Object>} Response with { success, data/error }
  */
+// DELETE carries a body too: the MITM stop endpoint takes { sudoPassword }.
+const METHODS_WITH_BODY = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 function makeRequest(method, path, body = null) {
   return new Promise((resolve) => {
     const httpModule = config.protocol === "https:" ? https : http;
@@ -98,8 +101,8 @@ function makeRequest(method, path, body = null) {
       },
     };
 
-    // Add Content-Length for POST/PUT requests
-    if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
+    // Add Content-Length for methods that carry a body
+    if (body && METHODS_WITH_BODY.has(method)) {
       const bodyString = JSON.stringify(body);
       options.headers["Content-Length"] = Buffer.byteLength(bodyString);
     }
@@ -157,7 +160,7 @@ function makeRequest(method, path, body = null) {
     req.setTimeout(30000);
 
     // Write body if present
-    if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
+    if (body && METHODS_WITH_BODY.has(method)) {
       req.write(JSON.stringify(body));
     }
 
@@ -390,6 +393,71 @@ async function resetCliToolSettings(tool) {
 }
 
 // ============================================================================
+// MITM API (Antigravity, Kiro, ... - IDE tools intercepted at the network layer)
+// ============================================================================
+
+// All MITM tools share one endpoint; the tool is a field in the body, not the path.
+const MITM_BASE = "/api/cli-tools/antigravity-mitm";
+
+/**
+ * Get MITM server + per-tool DNS status
+ * @returns {Promise<Object>} { success, data: { running, pid, certExists, certTrusted,
+ *   dnsStatus, hasCachedPassword, isWin, needsSudoPassword, isAdmin, mitmRouterBaseUrl } }
+ */
+async function getMitmStatus() {
+  return makeRequest("GET", MITM_BASE);
+}
+
+/**
+ * Start the MITM server (generates + serves the cert; does not touch DNS)
+ * @param {Object} body - { apiKey, sudoPassword?, mitmRouterBaseUrl?, forceKillPort443? }
+ * @returns {Promise<Object>} { success, data: { running, pid } }
+ *   On port conflict the server answers 409 with { code: "PORT_443_BUSY", portOwner }.
+ */
+async function startMitm(body) {
+  return makeRequest("POST", MITM_BASE, body);
+}
+
+/**
+ * Stop the MITM server (removes every DNS entry first)
+ * @param {string} sudoPassword - Empty string on Windows / when the password is cached
+ * @returns {Promise<Object>} { success, data: { running: false } }
+ */
+async function stopMitm(sudoPassword = "") {
+  return makeRequest("DELETE", MITM_BASE, { sudoPassword });
+}
+
+/**
+ * Toggle DNS for one tool, or trust the root certificate
+ * @param {Object} body - { tool, action: "enable" | "disable" | "trust-cert", sudoPassword? }
+ * @returns {Promise<Object>} { success, data: { dnsStatus } | { certTrusted } }
+ */
+async function patchMitm(body) {
+  return makeRequest("PATCH", MITM_BASE, body);
+}
+
+/**
+ * Read the model alias mapping for a tool
+ * @param {string} tool - Tool id, e.g. "antigravity"
+ * @returns {Promise<Object>} { success, data: { aliases } }
+ */
+async function getMitmAliases(tool) {
+  return makeRequest("GET", `${MITM_BASE}/alias?tool=${encodeURIComponent(tool)}`);
+}
+
+/**
+ * Replace the model alias mapping for a tool.
+ * The server stores exactly what it is sent, so callers must pass the full map,
+ * not just the entry they changed. Rejected with 403 while the tool's DNS is off.
+ * @param {string} tool - Tool id
+ * @param {Object} mappings - { [alias]: model }
+ * @returns {Promise<Object>} { success, data: { aliases } }
+ */
+async function saveMitmAliases(tool, mappings) {
+  return makeRequest("PUT", `${MITM_BASE}/alias`, { tool, mappings });
+}
+
+// ============================================================================
 // SETTINGS API
 // ============================================================================
 
@@ -532,6 +600,14 @@ module.exports = {
   getCliToolSettings,
   applyCliToolSettings,
   resetCliToolSettings,
+
+  // MITM
+  getMitmStatus,
+  startMitm,
+  stopMitm,
+  patchMitm,
+  getMitmAliases,
+  saveMitmAliases,
 
   // Settings
   getSettings,

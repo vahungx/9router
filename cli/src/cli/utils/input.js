@@ -77,6 +77,57 @@ async function confirm(question) {
   }
 }
 
+/**
+ * Read a secret without echoing it. Used for the sudo password the MITM endpoints
+ * need on macOS/Linux; on Windows privilege comes from the process being elevated,
+ * so callers skip this entirely.
+ *
+ * Keystrokes are masked with '*' and the answer is returned but never logged.
+ * @param {string} question
+ * @returns {Promise<string>} The entered password ("" if cancelled with ESC/Ctrl+C)
+ */
+async function promptPassword(question = "Sudo password: ") {
+  if (!process.stdin.isTTY) return prompt(question);
+
+  return suspendRawFor(() => new Promise((resolve) => {
+    let value = "";
+    let done = false;
+
+    try { process.stdin.setRawMode(true); } catch {}
+    process.stdin.resume();
+    process.stdin.setEncoding("utf8");
+    process.stdout.write(question);
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      process.stdin.removeListener("data", onData);
+      process.stdout.write("\n");
+      resolve(result);
+    };
+
+    const onData = (chunk) => {
+      for (const ch of String(chunk)) {
+        if (ch === "\r" || ch === "\n") return finish(value);
+        if (ch === "\u0003") return finish("");   // Ctrl+C — cancel, don't kill the TUI
+        if (ch === "\u001b") return finish("");   // ESC
+        if (ch === "\u007f" || ch === "\b") {     // Backspace
+          if (value.length > 0) {
+            value = value.slice(0, -1);
+            process.stdout.write("\b \b");
+          }
+          continue;
+        }
+        if (ch < " ") continue;                   // ignore remaining control chars
+        value += ch;
+        process.stdout.write("*");
+      }
+    };
+
+    process.stdin.on("data", onData);
+  }));
+}
+
 async function pause(message = "Press Enter to continue...") {
   return suspendRawFor(() => new Promise((resolve) => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -148,6 +199,7 @@ async function selectMenu(title, items, defaultIndex = 0, subtitle = "", headerC
 
 module.exports = {
   prompt,
+  promptPassword,
   select,
   confirm,
   pause,
