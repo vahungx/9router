@@ -1,9 +1,10 @@
 const api = require("../api/client");
-const { pause, confirm } = require("../utils/input");
+const { pause, confirm, promptPassword } = require("../utils/input");
 const { showStatus } = require("../utils/display");
 const { selectModelFromList } = require("../utils/modelSelector");
 const { showMenuWithBack } = require("../utils/menuHelper");
 const { getEndpoint } = require("../utils/endpoint");
+const { listMitmTools } = require("./mitmTools");
 
 const COLORS = {
   reset: "\x1b[0m",
@@ -573,6 +574,386 @@ async function showHermesMenu(port, breadcrumb = []) {
   });
 }
 
+// ─── MITM Tools (Antigravity) ─────────────────────────────────────────────────
+//
+// Unlike the tools above, a MITM tool is not configured by writing its settings
+// file — the IDE has no endpoint setting. 9Router points the tool's domain at
+// 127.0.0.1 via the hosts file and terminates TLS with its own root CA, so every
+// action here needs elevation: Administrator on Windows, root/sudo elsewhere.
+
+/**
+ * Resolve the privilege the MITM endpoints need for this platform.
+ * Windows takes no password — the process is either elevated or it is not.
+ * @param {Object} status - Payload from api.getMitmStatus()
+ * @returns {{ok: boolean, needsPassword: boolean, reason: string}}
+ */
+function checkMitmPrivilege(status) {
+  if (status.isAdmin) return { ok: true, needsPassword: false, reason: "" };
+  if (status.isWin) {
+    return { ok: false, needsPassword: false, reason: "Administrator required — restart 9Router as Administrator" };
+  }
+  if (status.hasCachedPassword || !status.needsSudoPassword) {
+    return { ok: true, needsPassword: false, reason: "" };
+  }
+  return { ok: true, needsPassword: true, reason: "" };
+}
+
+/**
+ * Fetch MITM status, reporting a stopped server as guidance rather than a stack trace.
+ * @returns {Promise<Object|null>} Status payload, or null when unreachable
+ */
+async function loadMitmStatus() {
+  const result = await api.getMitmStatus();
+  if (result.success) return result.data;
+
+  const msg = String(result.error || "");
+  if (msg.startsWith("Network error") || msg === "Request timeout") {
+    showStatus("Cannot reach 9Router server. Is it running?", "error");
+  } else {
+    showStatus(`Failed to load MITM status: ${result.error}`, "error");
+  }
+  return null;
+}
+
+/**
+ * Ask for the sudo password when the platform needs one, retrying on rejection.
+ * Returns "" on Windows and wherever sudo is already unlocked.
+ * @param {Object} status
+ * @returns {Promise<string|null>} Password, "" if not needed, null if cancelled
+ */
+async function resolveSudoPassword(status) {
+  const priv = checkMitmPrivilege(status);
+  if (!priv.ok) {
+    showStatus(priv.reason, "error");
+    await pause();
+    return null;
+  }
+  if (!priv.needsPassword) return "";
+
+  const pwd = await promptPassword(`${COLORS.dim}Sudo password (input hidden): ${COLORS.reset}`);
+  if (!pwd) {
+    showStatus("Cancelled — no password entered.", "info");
+    await pause();
+    return null;
+  }
+  return pwd;
+}
+
+/**
+ * Run one MITM call, re-prompting on a rejected sudo password (up to 3 tries).
+ * @param {Object} status
+ * @param {(pwd: string) => Promise<Object>} call - Receives the password, returns an api result
+ * @returns {Promise<Object|null>} The successful api result, or null if it gave up
+ */
+async function withSudoRetry(status, call) {
+  let pwd = await resolveSudoPassword(status);
+  if (pwd === null) return null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const result = await call(pwd);
+    if (result.success) return result;
+
+    // A wrong password comes back as 400/403 from the sudo layer; anything else is fatal.
+    const retriable = !status.isWin && (result.statusCode === 400 || result.statusCode === 403);
+    if (!retriable || attempt === 3) {
+      showStatus(`Failed: ${result.error}`, "error");
+      await pause();
+      return null;
+    }
+
+    showStatus(`${result.error} — try again (${attempt}/3)`, "error");
+    pwd = await promptPassword(`${COLORS.dim}Sudo password (input hidden): ${COLORS.reset}`);
+    if (!pwd) return null;
+  }
+  return null;
+}
+
+/**
+ * Start the MITM server, offering to reclaim port 443 when something else holds it.
+ * @param {Object} tool
+ * @param {Object} status
+ * @param {number} port
+ * @returns {Promise<boolean>} Whether the server ended up running
+ */
+async function mitmStart(tool, status, port) {
+  const apiKey = await getFirstApiKey();
+  if (!apiKey) {
+    showStatus("No API keys found. Create one in API Keys menu first.", "error");
+    await pause();
+    return false;
+  }
+
+  const pwd = await resolveSudoPassword(status);
+  if (pwd === null) return false;
+
+  const routerBaseUrl = status.mitmRouterBaseUrl || `http://localhost:${port}`;
+  const body = { apiKey, sudoPassword: pwd, mitmRouterBaseUrl: routerBaseUrl };
+
+  showStatus("Starting MITM server...", "info");
+  let result = await api.startMitm(body);
+
+  // 409 carries the process currently bound to :443 — let the user decide.
+  if (!result.success && result.statusCode === 409) {
+    showStatus(`Port 443 is in use: ${result.error}`, "error");
+    const force = await confirm("Stop that process and take port 443?");
+    if (!force) return false;
+    result = await api.startMitm({ ...body, forceKillPort443: true });
+  }
+
+  if (!result.success) {
+    showStatus(`Failed to start: ${result.error}`, "error");
+    await pause();
+    return false;
+  }
+
+  showStatus(`MITM server started (pid ${result.data.pid || "?"})`, "success");
+  return true;
+}
+
+/**
+ * Stop the MITM server. The server clears every DNS entry before it exits.
+ * @param {Object} status
+ * @returns {Promise<boolean>}
+ */
+async function mitmStop(status) {
+  const result = await withSudoRetry(status, pwd => api.stopMitm(pwd));
+  if (!result) return false;
+  showStatus("MITM server stopped.", "success");
+  return true;
+}
+
+/**
+ * Enable or disable the hosts-file redirect for one tool.
+ * @param {Object} tool
+ * @param {Object} status
+ * @param {"enable"|"disable"} action
+ * @returns {Promise<boolean>}
+ */
+async function mitmToggleDns(tool, status, action) {
+  const result = await withSudoRetry(status, pwd =>
+    api.patchMitm({ tool: tool.id, action, sudoPassword: pwd })
+  );
+  if (!result) return false;
+
+  if (action === "enable") {
+    showStatus(`DNS redirect enabled — restart ${tool.name} to apply.`, "success");
+  } else {
+    showStatus("DNS redirect disabled.", "success");
+  }
+  return true;
+}
+
+/**
+ * Install the 9Router root CA into the system trust store.
+ * @param {Object} tool
+ * @param {Object} status
+ * @returns {Promise<boolean>}
+ */
+async function mitmTrustCert(tool, status) {
+  const result = await withSudoRetry(status, pwd =>
+    api.patchMitm({ tool: tool.id, action: "trust-cert", sudoPassword: pwd })
+  );
+  if (!result) return false;
+  showStatus("Root certificate trusted.", "success");
+  return true;
+}
+
+/**
+ * One-shot path: trust cert → start server → enable DNS.
+ * @param {Object} tool
+ * @param {number} port
+ */
+async function mitmQuickSetup(tool, port) {
+  const status = await loadMitmStatus();
+  if (!status) { await pause(); return; }
+
+  const priv = checkMitmPrivilege(status);
+  if (!priv.ok) {
+    showStatus(priv.reason, "error");
+    await pause();
+    return;
+  }
+
+  console.log(`\n${COLORS.dim}This edits your hosts file and installs a root certificate.${COLORS.reset}`);
+  console.log(`${COLORS.dim}${tool.mitmDomain} will resolve to 127.0.0.1 while enabled.${COLORS.reset}\n`);
+  if (!await confirm("Continue?")) return;
+
+  if (!status.certTrusted && !await mitmTrustCert(tool, status)) return;
+
+  const fresh = (await loadMitmStatus()) || status;
+  if (!fresh.running && !await mitmStart(tool, fresh, port)) return;
+
+  const afterStart = (await loadMitmStatus()) || fresh;
+  if (!afterStart.dnsStatus?.[tool.id] && !await mitmToggleDns(tool, afterStart, "enable")) return;
+
+  showStatus(`Quick Setup completed! Restart ${tool.name} to apply.`, "success");
+  await pause();
+}
+
+/**
+ * Turn everything off: DNS entry first, then the server.
+ * @param {Object} tool
+ */
+async function mitmReset(tool) {
+  const status = await loadMitmStatus();
+  if (!status) { await pause(); return; }
+
+  if (status.dnsStatus?.[tool.id]) {
+    const afterDns = await mitmToggleDns(tool, status, "disable");
+    if (!afterDns) return;
+  }
+  if (status.running && !await mitmStop(status)) return;
+
+  showStatus(`${tool.name} MITM reset.`, "success");
+  await pause();
+}
+
+/**
+ * Edit which 9Router model each of the tool's built-in model names maps to.
+ * The alias endpoint replaces the whole map, so the current one is merged
+ * with the single edit before saving.
+ * @param {Object} tool
+ */
+async function mitmModelMapping(tool) {
+  const status = await loadMitmStatus();
+  if (!status) { await pause(); return; }
+
+  // The server rejects alias writes while the tool's DNS is off — say so here
+  // instead of letting the user pick a model and then hit a 403.
+  if (!status.dnsStatus?.[tool.id]) {
+    showStatus(`Enable DNS redirect for ${tool.name} before editing model mappings.`, "error");
+    await pause();
+    return;
+  }
+
+  const aliasResult = await api.getMitmAliases(tool.id);
+  const current = aliasResult.success ? (aliasResult.data.aliases || {}) : {};
+
+  const items = tool.defaultModels.map(m => ({
+    label: `${m.name}${m.mandatory ? " *" : ""}  ${COLORS.dim}→ ${current[m.alias] || "not mapped"}${COLORS.reset}`,
+    action: async () => {
+      const selected = await selectModelFromList(
+        `Map "${m.name}" to`,
+        current[m.alias] || "",
+        { excludeCombos: false }
+      );
+      if (!selected) return true;
+
+      const merged = { ...current, [m.alias]: selected };
+      const saved = await api.saveMitmAliases(tool.id, merged);
+      if (saved.success) {
+        current[m.alias] = selected;
+        showStatus(`${m.name} → ${selected} saved!`, "success");
+      } else {
+        showStatus(`Failed: ${saved.error}`, "error");
+      }
+      await pause();
+      return true;
+    }
+  }));
+
+  await showMenuWithBack({
+    title: `🎯 ${tool.name} Model Mapping`,
+    breadcrumb: [],
+    headerContent: `Map each ${tool.name} model to a 9Router model\n${COLORS.dim}* = required by the IDE's default mode${COLORS.reset}`,
+    items
+  });
+}
+
+/**
+ * Header showing server, certificate, DNS and privilege state.
+ * @param {Object} tool
+ * @returns {Promise<string>}
+ */
+function buildMitmHeader(tool) {
+  return async () => {
+    const status = await loadMitmStatus();
+    if (!status) return `  ${COLORS.red}Server unreachable${COLORS.reset}`;
+
+    const on = (label) => `${COLORS.green}✓ ${label}${COLORS.reset}`;
+    const off = (label) => `${COLORS.red}✗ ${label}${COLORS.reset}`;
+    const dnsOn = !!status.dnsStatus?.[tool.id];
+
+    const lines = [
+      `Server:   ${status.running ? on(`Running (pid ${status.pid || "?"})`) : off("Stopped")}`,
+      `Cert:     ${status.certTrusted ? on("Trusted") : (status.certExists ? `${COLORS.red}✗ Not trusted${COLORS.reset}` : off("Not generated"))}`,
+      `DNS:      ${dnsOn ? on(`${tool.mitmDomain} → 127.0.0.1`) : off("Not redirected")}`,
+    ];
+
+    const priv = checkMitmPrivilege(status);
+    if (!priv.ok) {
+      lines.push(`Access:   ${COLORS.red}✗ ${priv.reason}${COLORS.reset}`);
+    } else if (priv.needsPassword) {
+      lines.push(`Access:   ${COLORS.dim}sudo password required per action${COLORS.reset}`);
+    } else {
+      lines.push(`Access:   ${on(status.isWin ? "Administrator" : "root/sudo")}`);
+    }
+
+    if (!status.running && !dnsOn) {
+      lines.push(`${COLORS.dim}Run "Quick Setup" to configure${COLORS.reset}`);
+    }
+    return lines.join("\n");
+  };
+}
+
+/**
+ * Menu for one MITM tool.
+ * @param {Object} tool - Entry from mitmTools.js
+ * @param {number} port
+ * @param {Array<string>} breadcrumb
+ */
+async function showMitmToolMenu(tool, port, breadcrumb = []) {
+  await showMenuWithBack({
+    title: `🛰️  ${tool.name} (MITM)`,
+    breadcrumb,
+    headerContent: buildMitmHeader(tool),
+    refresh: async () => (await loadMitmStatus()) || {},
+    items: [
+      {
+        label: "⚡ Quick Setup",
+        action: async () => { await mitmQuickSetup(tool, port); return true; }
+      },
+      {
+        label: (d) => d?.running ? "Stop MITM Server" : "Start MITM Server",
+        action: async () => {
+          const status = await loadMitmStatus();
+          if (!status) { await pause(); return true; }
+          if (status.running) { if (await mitmStop(status)) await pause(); }
+          else if (await mitmStart(tool, status, port)) await pause();
+          return true;
+        }
+      },
+      {
+        label: (d) => d?.dnsStatus?.[tool.id] ? "Disable DNS Redirect" : "Enable DNS Redirect",
+        action: async () => {
+          const status = await loadMitmStatus();
+          if (!status) { await pause(); return true; }
+          const action = status.dnsStatus?.[tool.id] ? "disable" : "enable";
+          if (await mitmToggleDns(tool, status, action)) await pause();
+          return true;
+        }
+      },
+      {
+        label: "Trust Root Certificate",
+        action: async () => {
+          const status = await loadMitmStatus();
+          if (!status) { await pause(); return true; }
+          if (await mitmTrustCert(tool, status)) await pause();
+          return true;
+        }
+      },
+      {
+        label: "Model Mapping",
+        action: async () => { await mitmModelMapping(tool); return true; }
+      },
+      {
+        label: "Reset (disable DNS + stop server)",
+        action: async () => { await mitmReset(tool); return true; }
+      }
+    ]
+  });
+}
+
 // ─── Main CLI Tools Menu ──────────────────────────────────────────────────────
 
 /**
@@ -587,6 +968,14 @@ async function showCliToolsMenu(port, breadcrumb = []) {
     breadcrumb,
     headerContent: `Configure CLI tools to use 9Router\nEndpoint: ${endpoint}`,
     items: [
+      // MITM tools first, mirroring the dashboard's ordering.
+      ...listMitmTools().map(tool => ({
+        label: `${tool.name} (MITM)`,
+        action: async () => {
+          await showMitmToolMenu(tool, port, [...breadcrumb, tool.name]);
+          return true;
+        }
+      })),
       {
         label: "Claude Code",
         action: async () => { await showClaudeCodeMenu(port, [...breadcrumb, "Claude Code"]); return true; }
