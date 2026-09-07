@@ -91,6 +91,17 @@ if (args[0] === "mitm") {
   return;
 }
 
+if (args[0] === "chat") {
+  const { run } = require("./src/cli/commands/chat");
+  run(args.slice(1))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(`❌ ${err?.message || err}`);
+      process.exit(1);
+    });
+  return;
+}
+
 // Self-heal SQLite runtime deps (sql.js + better-sqlite3) into ~/.9router/runtime
 // so the server can resolve them via NODE_PATH. Best-effort — sql.js is required,
 // better-sqlite3 is optional. Logs to stderr only on failure.
@@ -172,6 +183,9 @@ Commands:
   mitm start|stop|status
                       Control the MITM proxy for closed IDEs (Antigravity)
                       (see: ${APP_NAME} mitm --help)
+
+  chat ["prompt"]     Chat with any model the gateway serves, from the terminal
+                      (see: ${APP_NAME} chat --help)
 `);
     process.exit(0);
   } else if (args[i] === "--version" || args[i] === "-v") {
